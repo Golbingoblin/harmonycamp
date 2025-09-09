@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>HarmonyCamp</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="./style.css" />
+  <!-- SoundFont Player (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/soundfont-player/dist/soundfont-player.js"></script>
+</head>
+<body>
+  <header>
+    <h1>HarmonyCamp</h1>
+    <div class="row">
+      <label>Backend URL</label>
+      <input id="apiBase" value="http://127.0.0.1:8000" />
+      <button id="btnPing">Ping</button>
+      <span id="pingStatus"></span>
+    </div>
+  </header>
+
+  <section id="controls">
+    <div class="row">
+      <label>MIDI 업로드</label>
+      <input id="midiFile" type="file" accept=".mid,.midi" />
+      <button id="btnHarmonize">Harmonize</button>
+      <a id="btnDownload" href="#" download style="display:none">Download MIDI</a>
+    </div>
+
+    <div class="row">
+      <label>장르</label>
+      <select id="genre"></select>
+
+      <label>Tempo</label>
+      <input id="tempo" type="number" value="120" min="20" max="240" />
+      
+      <label>Key</label>
+      <select id="keyMode">
+        <option value="detect">Detect</option>
+        <option value="c">C-collection</option>
+        <option value="manual">Manual…</option>
+      </select>
+      <input id="manualKey" placeholder="e.g., Gb major" style="width:120px" />
+    </div>
+
+    <div class="row">
+      <label>Detected Key</label>
+      <span id="keyLabel">–</span>
+    </div>
+    
+    <div class="row">
+      <label>표시 길이</label>
+      <select id="maxBars">
+        <option>8</option><option selected>16</option><option>24</option><option>32</option>
+      </select>
+      <label><input id="metronome" type="checkbox" /> 메트로놈</label>
+    </div>
+
+    <div class="mixer">
+      <div class="col">
+        <h4>Master</h4>
+        <label>Vol</label><input type="range" id="volMaster" min="0" max="1" step="0.01" value="0.9" />
+      </div>
+      <div class="col">
+        <h4>Melody</h4>
+        <label>Mute</label><input type="checkbox" id="muteMel" />
+        <label>Vol</label><input type="range" id="volMel" min="0" max="1" step="0.01" value="0.9" />
+      </div>
+      <div class="col">
+        <h4>Comping</h4>
+        <label>Mute</label><input type="checkbox" id="muteComp" />
+        <label>Vol</label><input type="range" id="volComp" min="0" max="1" step="0.01" value="0.7" />
+      </div>
+      <div class="col">
+        <h4>Bass</h4>
+        <label>Mute</label><input type="checkbox" id="muteBass" />
+        <label>Vol</label><input type="range" id="volBass" min="0" max="1" step="0.01" value="0.8" />
+      </div>
+      <div class="col">
+        <h4>Transport</h4>
+        <button id="btnPlay">Play</button>
+        <button id="btnStop">Stop</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="timeline">
+    <div class="legend">
+      <span>마디/박자</span><span>Chord</span><span>Melody</span><span>Comping</span><span>Bass</span>
+    </div>
+    <canvas id="canvas" width="1400" height="360"></canvas>
+  </section>
+
+  <section id="debug">
+    <details>
+      <summary>Debug Log</summary>
+      <pre id="log"></pre>
+    </details>
+  </section>
+
+  <script src="./main.js"></script>
+</body>
+</html>
