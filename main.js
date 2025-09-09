@@ -1,3 +1,8 @@
+const BACKEND_BASE =
+  window.location.hostname.includes('localhost') || window.location.hostname.includes('127.0.0.1')
+    ? 'http://127.0.0.1:8000'
+    : 'https://harmonycamp.onrender.com';
+
 // HarmonyCamp frontend – static, uses SoundFont in browser
 const $ = (sel) => document.querySelector(sel);
 const log = (x) => { const el=$("#log"); el.textContent += x+"\n"; el.scrollTop=el.scrollHeight; };
