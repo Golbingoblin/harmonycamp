@@ -1,249 +1,250 @@
-const BACKEND_BASE =
-  window.location.hostname.includes('localhost') || window.location.hostname.includes('127.0.0.1')
-    ? 'http://127.0.0.1:8000'
-    : 'https://harmonycamp.onrender.com';
+/* main.js — HarmonyCamp frontend glue (final)
+ * - Auto-detect backend API base
+ * - Load genres
+ * - Send /harmonize
+ * - Show key label and chosen progression log
+ * - Keep existing playback logic intact; optional <audio id="player"> support if audio_url returned
+ */
 
-// HarmonyCamp frontend – static, uses SoundFont in browser
-const $ = (sel) => document.querySelector(sel);
-const log = (x) => { const el=$("#log"); el.textContent += x+"\n"; el.scrollTop=el.scrollHeight; };
+(function () {
+  // ====== DOM Helpers ======
+  const $ = (sel) => document.querySelector(sel);
 
-let API_BASE = $("#apiBase").value;
-$("#apiBase").addEventListener("change", e => API_BASE = e.target.value);
+  // Optional elements (존재하지 않아도 동작)
+  const elFile     = $('#midiFile')    || $('#file') || null;
+  const elTempo    = $('#tempo')       || $('#bpm')  || null;
+  const elGenre    = $('#genre')       || $('#genreSelect') || null;
+  const elKeyLabel = $('#keyLabel')    || null;
+  const elStatus   = $('#status')      || null;
+  const elBtnHarm  = $('#btnHarmonize')|| $('#harmonizeBtn') || null;
+  const elBtnPlay  = $('#btnPlay')     || null;
+  const elBtnStop  = $('#btnStop')     || null;
+  const elDnld     = $('#btnDownload') || $('#downloadBtn') || null;
+  const elBackend  = $('#backendLabel')|| null; // 있으면 현재 API 표시
+  const elAudio    = $('#player')      || null; // <audio id="player"> 있으면 사용
 
-// simple ping
-$("#btnPing").onclick = async () => {
-  try {
-    const r = await fetch(`${API_BASE}/health`); $("#pingStatus").textContent = r.ok ? "OK" : "NG";
-  } catch { $("#pingStatus").textContent = "ERR"; }
-};
+  // 없으면 만들어 붙임(페이지 하단)
+  let elLog = $('#debugLog');
+  if (!elLog) {
+    elLog = document.createElement('pre');
+    elLog.id = 'debugLog';
+    elLog.style.whiteSpace = 'pre-wrap';
+    elLog.style.fontFamily = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+    elLog.style.fontSize = '12px';
+    elLog.style.padding = '8px';
+    elLog.style.border = '1px solid #ddd';
+    elLog.style.borderRadius = '6px';
+    elLog.style.background = '#fafafa';
+    elLog.style.maxHeight = '220px';
+    elLog.style.overflow = 'auto';
+    document.body.appendChild(elLog);
+  }
+  const log = (...msgs) => {
+    const line = msgs.map(x => typeof x === 'object' ? JSON.stringify(x) : String(x)).join(' ');
+    elLog.textContent += (line + '\n');
+    elLog.scrollTop = elLog.scrollHeight;
+    console.debug('[HC]', ...msgs);
+  };
 
-// get genres
-async function loadGenres(){
-  try {
-    const r = await fetch(`${API_BASE}/list-genres`); const j = await r.json();
-    const g = $("#genre"); g.innerHTML = ""; (j.genres||["basic"]).forEach(s=>{
-      const o=document.createElement("option"); o.value=o.textContent=s; g.appendChild(o);
-    });
-  } catch (e) { log("list-genres error: "+e); }
-}
-loadGenres();
+  const setStatus = (s) => { if (elStatus) elStatus.textContent = s; log(s); };
 
-// state from backend
-let LAST = null;  // {bpm,bar_beats,bars_shown, chords, melody, comping, bass, download_url, key_label?, progression_names?}
+  // ====== Backend auto-detect ======
+  const FALLBACK_RENDER_URL = 'https://harmonycamp-backend.onrender.com'; // 배포한 Render URL로 바꾸면 더 빨라짐(선택)
+  const HEALTH_PATH = '/health';
 
-// canvas drawing (very simple piano-roll)
-// lanes: bar grid, chord rail, melody, comping, bass
-function drawTimeline(){
-  const cvs = $("#canvas"), ctx = cvs.getContext("2d");
-  const W = cvs.width, H = cvs.height;
-  ctx.clearRect(0,0,W,H);
-  ctx.font = "12px sans-serif";
-
-  if(!LAST){
-    ctx.fillStyle="#222"; ctx.fillText("Upload a MIDI and click Harmonize.", 20, 20);
-    return;
+  async function ping(base) {
+    try {
+      const url = base.replace(/\/+$/, '') + HEALTH_PATH;
+      const r = await fetch(url, { method: 'GET', mode: 'cors' });
+      if (!r.ok) return false;
+      const text = await r.text();
+      return text.trim().toLowerCase().includes('ok');
+    } catch (e) {
+      return false;
+    }
   }
 
-  const barBeats = LAST.bar_beats;
-  const bars = LAST.bars_shown;
-  const beatsTotal = Math.max(1, barBeats * bars);
+  async function autoDetectBackend() {
+    // 1) 수동 지정(전역/로컬 저장)
+    if (window.HARMONY_BACKEND) {
+      if (await ping(window.HARMONY_BACKEND)) return window.HARMONY_BACKEND.replace(/\/+$/, '');
+    }
+    const saved = localStorage.getItem('backendBase');
+    if (saved && await ping(saved)) return saved.replace(/\/+$/, '');
 
-  // layout rows
-  const ROWS = [
-    {name:"bars",   y: 20,  h: 40},
-    {name:"chord",  y: 70,  h: 40},
-    {name:"melody", y: 120, h: 70, color:"#2f80ed"},
-    {name:"comp",   y: 200, h: 70, color:"#10b981"},
-    {name:"bass",   y: 280, h: 70, color:"#ef4444"},
-  ];
-  const leftPad = 60, rightPad = 20;
-  const innerW = W - leftPad - rightPad;
+    // 2) 개발/로컬
+    const host = location.hostname;
+    if (/^(localhost|127\.0\.0\.1)$/i.test(host)) {
+      const local = 'http://127.0.0.1:8000';
+      if (await ping(local)) return local;
+    }
 
-  const xOf = (beats) => leftPad + innerW * (beats / beatsTotal);
+    // 3) 동일 오리진 프록시(/api) — GitHub Pages는 보통 불가하지만 혹시 모름
+    const sameOriginApi = location.origin.replace(/\/+$/, '') + '/api';
+    if (await ping(sameOriginApi)) return sameOriginApi;
 
-  // bar grid
-  ctx.strokeStyle="#ddd"; ctx.lineWidth=1;
-  for(let b=0;b<=bars;b++){
-    const x = xOf(b*barBeats);
-    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
-    ctx.fillStyle="#666"; ctx.fillText(`${b+1}`, x+3, ROWS[0].y+12);
-  }
-  // beat ticks
-  ctx.strokeStyle="#f1f1f1";
-  for(let k=0;k<beatsTotal;k++){
-    const x = xOf(k);
-    ctx.beginPath(); ctx.moveTo(x, ROWS[0].y); ctx.lineTo(x, H); ctx.stroke();
+    // 4) Render 기본값(수정 가능)
+    if (await ping(FALLBACK_RENDER_URL)) return FALLBACK_RENDER_URL.replace(/\/+$/, '');
+
+    return null;
   }
 
-  // chord rail
-  (LAST.chords||[]).forEach(c=>{
-    const x0=xOf(c.start_beats), x1=xOf(c.end_beats);
-    ctx.fillStyle="#fff4cc"; ctx.strokeStyle="#eab308";
-    ctx.fillRect(x0, ROWS[1].y, x1-x0, ROWS[1].h-10);
-    ctx.strokeRect(x0, ROWS[1].y, x1-x0, ROWS[1].h-10);
-    ctx.fillStyle="#000"; ctx.fillText(c.label, x0+4, ROWS[1].y+18);
+  let API_BASE = null;
+
+  // ====== API ======
+  async function getJSON(url) {
+    const r = await fetch(url, { method: 'GET' });
+    if (!r.ok) throw new Error(`GET ${url} -> ${r.status}`);
+    return r.json();
+  }
+
+  async function postForm(url, formData) {
+    const r = await fetch(url, { method: 'POST', body: formData });
+    if (!r.ok) {
+      let detail = '';
+      try { detail = await r.text(); } catch {}
+      throw new Error(`POST ${url} -> ${r.status} ${detail}`);
+    }
+    return r.json();
+  }
+
+  // ====== Genres ======
+  async function loadGenres() {
+    const sel = elGenre;
+    if (!sel) { log('genre select not found; skip'); return; }
+    try {
+      const data = await getJSON(API_BASE + '/genres');
+      const list = Array.isArray(data) ? data : (data.genres || []);
+      if (!list.length) throw new Error('empty genres');
+      sel.innerHTML = '';
+      for (const g of list) {
+        const opt = document.createElement('option');
+        opt.value = g; opt.textContent = g;
+        sel.appendChild(opt);
+      }
+      log('Genres loaded:', list);
+    } catch (e) {
+      log('Failed to load /genres, using fallback:', e.message);
+      sel.innerHTML = '<option value="basic">basic</option>';
+    }
+  }
+
+  // ====== Harmonize ======
+  async function doHarmonize() {
+    if (!API_BASE) {
+      alert('Backend API not detected. Check your Render URL or run backend locally.');
+      return;
+    }
+    if (!elFile || !elFile.files || !elFile.files[0]) {
+      alert('MIDI 파일을 선택하세요.');
+      return;
+    }
+    const midiFile = elFile.files[0];
+    const bpm = (elTempo && elTempo.value) ? String(elTempo.value) : '120';
+    const genre = (elGenre && elGenre.value) ? elGenre.value : 'basic';
+
+    const fd = new FormData();
+    fd.append('midi_file', midiFile, midiFile.name);
+    fd.append('bpm', bpm);
+    fd.append('genre', genre);
+
+    setStatus('Harmonizing… (업로드 중)');
+
+    try {
+      const res = await postForm(API_BASE + '/harmonize', fd);
+
+      // Expect: { ok, key_label, chosen_progressions, midi_url, audio_url?, total_beats? }
+      if (res.key_label && elKeyLabel) {
+        elKeyLabel.textContent = res.key_label;
+      }
+      // 선택된 코드 진행 로그
+      if (Array.isArray(res.chosen_progressions) && res.chosen_progressions.length) {
+        log('— Selected progressions (per 8-bar block) —');
+        res.chosen_progressions.forEach((name, idx) => {
+          log(`  Block ${idx + 1}: ${name}`);
+        });
+      } else {
+        log('No chosen_progressions in response (or empty).');
+      }
+
+      // 다운로드 버튼 연결
+      if (elDnld && res.midi_url) {
+        elDnld.href = res.midi_url;
+        elDnld.download = (midiFile.name.replace(/\.(mid|midi)$/i, '') || 'harmonized') + '_HC.mid';
+        elDnld.removeAttribute('disabled');
+      }
+
+      // 오디오 재생(선택) — <audio id="player">가 있을 때만
+      if (elAudio && res.audio_url) {
+        try {
+          elAudio.src = res.audio_url;
+          await elAudio.play();
+          log('Audio started via <audio> element.');
+        } catch (e) {
+          log('Audio element play failed:', e.message);
+        }
+      }
+
+      setStatus('완료: Harmonized.');
+    } catch (e) {
+      log('Harmonize failed:', e.message);
+      setStatus('오류: Harmonize 실패. 콘솔/로그 확인.');
+      alert('Harmonize 실패: ' + e.message);
+    }
+  }
+
+  // ====== Wire UI ======
+  function wireUI() {
+    if (elBtnHarm) {
+      elBtnHarm.addEventListener('click', (e) => {
+        e.preventDefault();
+        doHarmonize();
+      });
+    }
+
+    // 파일 선택시 표시
+    if (elFile) {
+      elFile.addEventListener('change', () => {
+        if (elFile.files && elFile.files[0]) {
+          log('Selected file:', elFile.files[0].name);
+        }
+      });
+    }
+
+    // 백엔드 수동 설정 UI(옵션)
+    // index.html에 <input id="backendInput">, <button id="backendSave">가 있으면 저장 지원
+    const elBackendInput = $('#backendInput');
+    const elBackendSave  = $('#backendSave');
+    if (elBackendInput && elBackendSave) {
+      elBackendSave.addEventListener('click', async () => {
+        const v = (elBackendInput.value || '').trim();
+        if (!v) { alert('빈 값입니다.'); return; }
+        if (await ping(v)) {
+          API_BASE = v.replace(/\/+$/, '');
+          localStorage.setItem('backendBase', API_BASE);
+          if (elBackend) elBackend.textContent = API_BASE;
+          setStatus('Backend saved: ' + API_BASE);
+          await loadGenres();
+        } else {
+          alert('해당 주소로 /health 확인 실패: ' + v);
+        }
+      });
+    }
+  }
+
+  // ====== Boot ======
+  window.addEventListener('DOMContentLoaded', async () => {
+    wireUI();
+    setStatus('Backend 탐지 중…');
+    API_BASE = await autoDetectBackend();
+
+    if (!API_BASE) {
+      setStatus('Backend 탐지 실패. 상단/설정에서 백엔드 URL 직접 입력 후 저장하세요.');
+      log('Tip) Render로 배포했다면 예: https://<your-app>.onrender.com');
+    } else {
+      if (elBackend) elBackend.textContent = API_BASE;
+      setStatus('Backend 연결: ' + API_BASE);
+      await loadGenres();
+    }
   });
-
-  // note lanes (rough line segments by pitch)
-  function drawNotes(notes, row, col){
-    if(!notes) return;
-    const pMin=36, pMax=84; // normalize to visual range
-    ctx.strokeStyle=col; ctx.lineWidth=3; ctx.globalAlpha=0.85;
-    notes.forEach(n=>{
-      const x0=xOf(n.start), x1=xOf(n.end);
-      const y=row.y + row.h - ((n.pitch-pMin)/(pMax-pMin)) * (row.h-10) - 5;
-      ctx.beginPath(); ctx.moveTo(x0,y); ctx.lineTo(x1,y); ctx.stroke();
-    });
-    ctx.globalAlpha=1;
-  }
-  drawNotes(LAST.melody, ROWS[2], ROWS[2].color);
-  drawNotes(LAST.comping, ROWS[3], ROWS[3].color);
-  drawNotes(LAST.bass,   ROWS[4], ROWS[4].color);
-
-  // left captions
-  ctx.fillStyle="#333"; ctx.fillText("Bars", 10, ROWS[0].y+18);
-  ctx.fillText("Chord",10, ROWS[1].y+18);
-  ctx.fillText("Mel",  10, ROWS[2].y+18);
-  ctx.fillText("Comp", 10, ROWS[3].y+18);
-  ctx.fillText("Bass", 10, ROWS[4].y+18);
-
-  // top-right key display (also mirrors into #keyLabel if present)
-  const keyTxt = LAST.key_label || LAST.key || (LAST.key_detected && LAST.key_detected.label) || "";
-  if (keyTxt){
-    ctx.fillStyle = "#111";
-    ctx.fillText(`Key: ${keyTxt}`, W - 120, 16);
-  }
-}
-
-// request harmonize
-$("#btnHarmonize").onclick = async () => {
-  const f = $("#midiFile").files[0]; if(!f){ alert("MIDI 파일을 선택하세요"); return; }
-  const fd = new FormData();
-  fd.append("file", f);
-  fd.append("genre", $("#genre").value);
-  fd.append("bpm_override", $("#tempo").value);
-  fd.append("max_bars", $("#maxBars").value);
-  fd.append("key_mode", $("#keyMode").value);
-  fd.append("manual_key", $("#manualKey").value || "");
-
-  $("#btnDownload").style.display="none";
-  log("Uploading…");
-  const r = await fetch(`${API_BASE}/analyze`, { method:"POST", body: fd });
-  if(!r.ok){ const t=await r.text(); log("analyze error: "+t); alert("Analyze 실패"); return; }
-  LAST = await r.json();
-
-  // --- UI reflects key & chosen progressions ---
-  const keyTxt = LAST.key_label || LAST.key || (LAST.key_detected && LAST.key_detected.label) || "(unknown)";
-  const keyEl = $("#keyLabel"); if (keyEl) keyEl.textContent = keyTxt;
-  log(`Analyze OK. BPM=${LAST.bpm} bars=${LAST.bars_shown}  Key=${keyTxt}`);
-
-  // Try to find progression names array in several common shapes
-  const progNames =
-    LAST.progression_names ||
-    (LAST.debug && LAST.debug.progression_names) ||
-    LAST.chosen ||
-    LAST.progs ||
-    null;
-
-  if (Array.isArray(progNames) && progNames.length){
-    log("Chosen progressions per block:");
-    progNames.forEach((nm, i)=> log(`  block ${i+1}: ${nm}`));
-  } else {
-    log("(No progression name array found in response)");
-  }
-
-  drawTimeline();
-  const a = $("#btnDownload");
-  if (LAST.download_url){
-    a.href = `${API_BASE}${LAST.download_url}`; a.style.display="inline-block";
-  } else {
-    a.style.display = "none";
-  }
-};
-
-// ── playback with SoundFont (WebAudio) ──────────────────────────────────────
-const AudioContext = window.AudioContext || window.webkitAudioContext;
-const ctx = new AudioContext();
-
-const masterGain = ctx.createGain(); masterGain.gain.value = +$("#volMaster").value; masterGain.connect(ctx.destination);
-const gMel = ctx.createGain(), gComp = ctx.createGain(), gBass = ctx.createGain();
-gMel.connect(masterGain); gComp.connect(masterGain); gBass.connect(masterGain);
-// metronome: separate from master (not affected)
-const gMet = ctx.createGain(); gMet.gain.value = 0.7; gMet.connect(ctx.destination);
-
-// sliders & mute
-$("#volMaster").oninput = e => masterGain.gain.value = +e.target.value;
-$("#volMel").oninput = e => gMel.gain.value = $("#muteMel").checked ? 0 : +e.target.value;
-$("#volComp").oninput = e => gComp.gain.value = $("#muteComp").checked ? 0 : +e.target.value;
-$("#volBass").oninput = e => gBass.gain.value = $("#muteBass").checked ? 0 : +e.target.value;
-$("#muteMel").onchange = () => $("#volMel").dispatchEvent(new Event("input"));
-$("#muteComp").onchange = () => $("#volComp").dispatchEvent(new Event("input"));
-$("#muteBass").onchange = () => $("#volBass").dispatchEvent(new Event("input"));
-
-// instruments via CDN (quick path)
-let instMel=null, instComp=null, instBass=null;
-async function ensureInstruments(){
-  if(!instMel)  { instMel  = await window.Soundfont.instrument(ctx, 'acoustic_grand_piano'); instMel.connect(gMel); }
-  if(!instComp) { instComp = await window.Soundfont.instrument(ctx, 'acoustic_grand_piano'); instComp.connect(gComp); }
-  if(!instBass) { instBass = await window.Soundfont.instrument(ctx, 'acoustic_bass');        instBass.connect(gBass); }
-}
-
-// scheduling
-let playing = false;
-function scheduleNote(inst, when, midi, dur, vel=0.9){
-  // soundfont-player handles its own envelopes; instrument already routed to part gain
-  inst.play(midi, when, {gain: vel, duration: dur, adsr: [0.002,0.02,0.7,0.05]});
-}
-
-function stopAll(){
-  try{ instMel && instMel.stop(); }catch{}
-  try{ instComp && instComp.stop(); }catch{}
-  try{ instBass && instBass.stop(); }catch{}
-  playing = false;
-}
-
-function scheduleMetronome(startTime, bpm, bars, barBeats){
-  if(!$("#metronome").checked) return;
-  const secPerBeat = 60/bpm;
-  for(let b=0;b<bars*barBeats;b++){
-    const t = startTime + b*secPerBeat;
-    const osc = ctx.createOscillator(); const g = ctx.createGain();
-    const isDown = (b % barBeats)===0;
-    g.gain.setValueAtTime(isDown?0.25:0.12, t);
-    g.gain.exponentialRampToValueAtTime(0.0001, t+0.04);
-    osc.frequency.value = isDown?1400:900;
-    osc.connect(g); g.connect(gMet);
-    osc.start(t); osc.stop(t+0.05);
-  }
-}
-
-$("#btnPlay").onclick = async () => {
-  if(!LAST){ alert("먼저 Harmonize 하세요."); return; }
-  await ctx.resume();            // unlock audio (autoplay policies)
-  await ensureInstruments();     // lazy-load SF2s
-  const bpm = +$("#tempo").value || LAST.bpm;
-  const secPerBeat = 60/bpm;
-  const start = ctx.currentTime + 0.1;
-
-  const bars = LAST.bars_shown, barBeats = LAST.bar_beats;
-  scheduleMetronome(start, bpm, bars, barBeats);
-
-  function sched(arr, inst){
-    (arr||[]).forEach(n=>{
-      const t = start + n.start*secPerBeat;
-      const d = Math.max(0.02, (n.end-n.start)*secPerBeat);
-      const v = Math.min(1, (n.velocity||100)/100);
-      scheduleNote(inst, t, n.pitch, d, v);
-    });
-  }
-  if (!$("#muteMel").checked)  sched(LAST.melody, instMel);
-  if (!$("#muteComp").checked) sched(LAST.comping, instComp);
-  if (!$("#muteBass").checked) sched(LAST.bass,   instBass);
-
-  playing = true;
-};
-
-$("#btnStop").onclick = stopAll;
-
-// redraw on resize
-window.addEventListener("resize", drawTimeline);
+})();
