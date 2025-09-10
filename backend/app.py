@@ -1,227 +1,217 @@
+# app.py — HarmonyCamp backend (FastAPI)
+# - Endpoints: /health, /genres, /list-genres (alias), /harmonize, /analyze (alias)
+# - Uses existing harmonizator_keyed.py WITHOUT modifying it
+# - Returns: key_label, chosen_progressions, midi_url (and optional audio_url stub)
+
 import os
 import io
-import time
-import math
+import uuid
+import glob
 import random
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form, Request
+from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 프로젝트 경로들
-# ──────────────────────────────────────────────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(BASE_DIR, "output_harmonizator")
-PATTERN_DIR = os.path.join(BASE_DIR, "accomp_patterns")
-CHORD_CSV = os.path.join(BASE_DIR, "chord.CSV")
-PROG_CSV = os.path.join(BASE_DIR, "prog16.CSV")
+# ===== Import user's existing engine (no modification) =====
+# harmonizator_keyed.py must be in the same directory or importable
+from harmonizator_keyed import (
+    # data types
+    Note, PatternRhythm, Progression, ChordInfo, RenderedSong,
+    # loaders
+    load_chord_table, load_prog16,
+    # midi & analysis
+    melody_notes_from_midifile,
+    guess_key_from_melody, semitone_offset_for_key,
+    transpose_notes,
+    choose_progressions_for_blocks,
+    resolve_progression_from_C, transpose_resolved_progression,
+    assemble_from_resolved_progressions,
+    export_mid,
+    extract_pattern_rhythm,
+    pick_random_mid_in,
+    # constants
+    NAMES_SHARP, BLOCK_BEATS, BAR_BEATS, CH_MELODY_DEFAULT
+)
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# ===== App =====
+app = FastAPI(title="HarmonyCamp Backend", version="1.0.0")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# harmonizator_keyed.py import (수정 없이 사용)
-# ──────────────────────────────────────────────────────────────────────────────
-import sys
-if BASE_DIR not in sys.path:
-    sys.path.append(BASE_DIR)
-
-try:
-    import harmonizator_keyed as HK
-except Exception as e:
-    raise RuntimeError(f"Failed to import harmonizator_keyed.py: {e}")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FastAPI & CORS
-# ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="HarmonyCamp Backend", version="0.1.0")
-
-# 필요 시 환경변수로 추가 오리진 설정 가능 (쉼표로 구분)
-extra_origins = os.environ.get("CORS_ORIGINS", "").strip()
-ALLOW_ORIGINS = ["https://golbingoblin.github.io", "http://localhost:5500", "http://127.0.0.1:5500"]
-if extra_origins:
-    ALLOW_ORIGINS += [o.strip() for o in extra_origins.split(",") if o.strip()]
-
+# Allow CORS (GitHub Pages 등 외부 오리진)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS,
+    allow_origins=["*"],  # 필요시 ["https://golbingoblin.github.io"] 로 좁히세요
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 생성물(static) 서빙 (다운로드 링크 제공)
-app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PUBLIC_DIR = os.path.join(BASE_DIR, "public")
+os.makedirs(PUBLIC_DIR, exist_ok=True)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 전역 로드(앱 시작 시 1회)
-# ──────────────────────────────────────────────────────────────────────────────
-try:
-    PC_NAMES, CHORD_TABLE = HK.load_chord_table(CHORD_CSV)
-    PROGRESSIONS = HK.load_prog16(PROG_CSV)
-except Exception as e:
-    # CSV 없으면 서버는 떠 있지만 analyze 시 에러 반환
-    PC_NAMES, CHORD_TABLE, PROGRESSIONS = [], {}, []
-    print("[WARN] Failed to load chord/prog CSVs at startup:", e)
+# Static mount for generated files
+app.mount("/files", StaticFiles(directory=PUBLIC_DIR), name="files")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 유틸
-# ──────────────────────────────────────────────────────────────────────────────
-def _pick_random_mid_in(folder: str) -> Optional[str]:
-    cands = []
-    for ext in ("*.mid", "*.midi"):
-        cands.extend([os.path.join(folder, x) for x in os.listdir(folder) if x.lower().endswith(ext[1:])])
-    return random.choice(cands) if cands else None
+# ====== cache: load chord/prog once ======
+PC_NAMES, CHORD_TABLE = load_chord_table(os.path.join(BASE_DIR, "chord.CSV"))
+PROGS = load_prog16(os.path.join(BASE_DIR, "prog16.CSV"))
 
-def _limit_melody_to_bars(notes: List[HK.Note], max_bars: int, beats_per_bar: float = HK.BAR_BEATS) -> List[HK.Note]:
-    if max_bars <= 0:
-        return notes
-    max_beats = max_bars * beats_per_bar
-    out: List[HK.Note] = []
-    for n in notes:
-        if n.start_beat >= max_beats:
-            continue
-        end = min(n.end_beat, max_beats)
-        if end - n.start_beat > HK.EPS_BEAT:
-            out.append(HK.Note(n.start_beat, end, n.pitch, n.velocity))
-    return out
-
-def _make_segments_from_progression_labels(p: HK.Progression, block_index: int) -> List[dict]:
-    """프론트에서 코드 변환지점 시각화용. 16분 그리드 기준 세그먼트 → 비트 시간."""
-    segs = HK.chord_segments(p.seq)
+def list_genres() -> List[str]:
+    root = os.path.join(BASE_DIR, "accomp_patterns")
+    if not os.path.isdir(root):
+        return []
     out = []
-    for st_step, en_step, tok in segs:
-        st_b = block_index * HK.BLOCK_BEATS + st_step * HK.SIXTEENTH
-        en_b = block_index * HK.BLOCK_BEATS + en_step * HK.SIXTEENTH
-        out.append({"start_beat": st_b, "end_beat": en_b, "token": tok or ""})
+    for d in sorted(os.listdir(root)):
+        gpath = os.path.join(root, d)
+        if not os.path.isdir(gpath):
+            continue
+        if os.path.isdir(os.path.join(gpath, "bass")) and os.path.isdir(os.path.join(gpath, "comping")):
+            out.append(d)
     return out
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 엔드포인트
-# ──────────────────────────────────────────────────────────────────────────────
-@app.get("/health")
-def health():
-    return {"ok": True}
+# ====== Utils ======
+def choose_patterns_for_genre(genre: str) -> tuple[PatternRhythm, PatternRhythm, str]:
+    """Pick one bass & one comping pattern MIDI from genre folders; fallback to 'basic'."""
+    def pick_from(folder: str) -> Optional[str]:
+        cand = sorted(glob.glob(os.path.join(folder, "*.mid")) + glob.glob(os.path.join(folder, "*.midi")))
+        return random.choice(cand) if cand else None
 
-@app.get("/list-genres")
-def list_genres():
-    if not os.path.isdir(PATTERN_DIR):
-        return {"genres": []}
-    genres = []
-    for d in sorted(os.listdir(PATTERN_DIR)):
-        full = os.path.join(PATTERN_DIR, d)
-        if not os.path.isdir(full):
-            continue
-        if os.path.isdir(os.path.join(full, "bass")) and os.path.isdir(os.path.join(full, "comping")):
-            genres.append(d)
-    return {"genres": genres}
-
-@app.post("/analyze")
-async def analyze(
-    file: UploadFile = File(...),
-    genre: str = Form(...),
-    bpm: Optional[float] = Form(None),
-    max_bars: int = Form(16),
-):
-    # 사전 체크
-    if not CHORD_TABLE or not PROGRESSIONS:
-        raise HTTPException(status_code=500, detail="chord.CSV / prog16.CSV not loaded on server.")
-
-    # 패턴 로드
-    gdir = os.path.join(PATTERN_DIR, genre)
+    base = os.path.join(BASE_DIR, "accomp_patterns")
+    gdir = os.path.join(base, genre)
     if not os.path.isdir(gdir):
-        raise HTTPException(status_code=400, detail=f"Genre '{genre}' not found.")
+        # fallback to 'basic'
+        gdir = os.path.join(base, "basic")
+        genre = "basic"
 
     bass_dir = os.path.join(gdir, "bass")
     comp_dir = os.path.join(gdir, "comping")
-    if not (os.path.isdir(bass_dir) and os.path.isdir(comp_dir)):
-        raise HTTPException(status_code=400, detail=f"Genre '{genre}' must have 'bass' and 'comping' subfolders.")
 
-    bass_mid = _pick_random_mid_in(bass_dir)
-    comp_mid = _pick_random_mid_in(comp_dir)
-    if not (bass_mid and comp_mid):
-        raise HTTPException(status_code=400, detail=f"No pattern MIDI in '{genre}/bass' or '{genre}/comping'.")
+    b_path = pick_from(bass_dir)
+    c_path = pick_from(comp_dir)
 
-    pat_bass = HK.extract_pattern_rhythm(bass_mid)
-    pat_comp = HK.extract_pattern_rhythm(comp_mid)
+    # final fallbacks
+    if not b_path:
+        b_path = pick_from(os.path.join(base, "basic", "bass"))
+    if not c_path:
+        c_path = pick_from(os.path.join(base, "basic", "comping"))
 
-    # 업로드 MIDI 읽기
-    raw = await file.read()
-    if not raw:
-        raise HTTPException(status_code=400, detail="Empty file.")
+    if not b_path or not c_path:
+        raise RuntimeError("No pattern MIDIs found under accomp_patterns.")
 
-    # mido는 파일 경로가 필요 없고 메모리로도 가능하지만,
-    # 기존 HK 함수는 파일 경로 기반이므로 임시파일로 저장 후 사용
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    tmp_in = os.path.join(OUTPUT_DIR, f"uploaded_{ts}.mid")
+    pat_bass = extract_pattern_rhythm(b_path)
+    pat_comp = extract_pattern_rhythm(c_path)
+    return pat_bass, pat_comp, genre
+
+def make_abs_url(request: Request, rel_path: str) -> str:
+    base = str(request.base_url).rstrip("/")
+    rel = rel_path if rel_path.startswith("/") else "/" + rel_path
+    return base + rel
+
+# ====== Endpoints ======
+@app.get("/health")
+def health():
+    return PlainTextResponse("ok true")
+
+@app.get("/genres")
+def genres():
+    gs = list_genres()
+    if not gs:
+        gs = ["basic"]  # last resort
+    return {"genres": gs}
+
+# alias for older frontends
+@app.get("/list-genres")
+def list_genres_alias():
+    return genres()
+
+@app.post("/harmonize")
+async def harmonize(
+    request: Request,
+    midi_file: UploadFile = File(...),
+    bpm: float = Form(120.0),
+    genre: str = Form("basic"),
+):
+    """
+    Pipeline (non-interactive):
+      1) read melody MIDI
+      2) auto-detect key from melody
+      3) transpose melody -> C/Am (selection only)
+      4) choose progressions per block in C/Am
+      5) resolve tone-maps in C (csv used once)
+      6) transpose maps back to original key
+      7) re-voice accompaniment in ORIGINAL key
+      8) export single MIDI file and return URL + metadata
+    """
+    # save upload to bytes -> temp file
+    data = await midi_file.read()
+    tmp_in = os.path.join(PUBLIC_DIR, f"upload_{uuid.uuid4().hex}.mid")
     with open(tmp_in, "wb") as f:
-        f.write(raw)
+        f.write(data)
 
-    # 멜로디 노트 추출
-    melody, total_beats, first_tempo_us = HK.melody_notes_from_midifile(tmp_in)
+    # 1) melody
+    melody, total_beats, first_tempo = melody_notes_from_midifile(tmp_in)
     if not melody:
-        raise HTTPException(status_code=400, detail="No melody notes found in uploaded MIDI.")
+        return JSONResponse(status_code=400, content={"detail": "No melody notes detected in MIDI (non-drum)."})
 
-    # 마디 제한
-    melody = _limit_melody_to_bars(melody, max_bars=max_bars, beats_per_bar=HK.BAR_BEATS)
-    if not melody:
-        raise HTTPException(status_code=400, detail="Melody truncated to 0 beats by max_bars limit.")
+    # 2) key detect
+    root_pc, mode = guess_key_from_melody(melody)
+    offset = semitone_offset_for_key(root_pc, mode)  # C/Am -> orig (+)
+    semi_to_C = (12 - offset) % 12                   # melody -> C/Am
+    key_label = f"Auto: {NAMES_SHARP[root_pc]} {mode} (offset +{offset})"
 
-    # BPM 결정 (업로드 파일 템포 > 폼값)
-    if bpm is None:
-        bpm = HK.mido.tempo2bpm(first_tempo_us) if first_tempo_us else 120.0
-    bpm = float(max(20.0, min(240.0, bpm)))
+    # 3) transpose melody to C for selection
+    melody_C = transpose_notes(melody, semi_to_C)
 
-    # 키 추정 (프롬프트 없음)
-    root_pc, mode = HK.guess_key_from_melody(melody)
-    offset = HK.semitone_offset_for_key(root_pc, mode)   # C/Am → 원키 (+)
-    semi_to_C = (12 - offset) % 12                       # melody → C/Am
-    melody_C = HK.transpose_notes(melody, semi_to_C)
+    # 4) choose in C
+    chosen_in_C = choose_progressions_for_blocks(melody_C, PROGS, CHORD_TABLE, PC_NAMES)
 
-    key_label = f"Auto: {HK.NAMES_SHARP[root_pc]} {mode} (offset +{offset})"
+    # 5) resolve in C
+    resolved_C   = [resolve_progression_from_C(p, CHORD_TABLE) for p in chosen_in_C]
 
-    # 진행 선택 (C/Am에서)
-    chosen_in_C = HK.choose_progressions_for_blocks(melody_C, PROGRESSIONS, CHORD_TABLE, PC_NAMES)
+    # 6) transpose maps to original key
+    resolved_key = [transpose_resolved_progression(rp, offset) for rp in resolved_C]
 
-    # (중요) 진행 토널맵을 C에서 해석 → 숫자 이조로 원키에 맞춤(이후 CSV 의존 X)
-    resolved_C = [HK.resolve_progression_from_C(p, CHORD_TABLE) for p in chosen_in_C]
-    resolved_key = [HK.transpose_resolved_progression(rp, offset) for rp in resolved_C]
+    # pick patterns for genre
+    try:
+        pat_bass, pat_comp, genre_used = choose_patterns_for_genre(genre)
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"detail": f"Pattern error: {e}"})
 
-    # 리보이싱 & 렌더
-    rendered_out, chosen_names = HK.assemble_from_resolved_progressions(melody, resolved_key, pat_bass, pat_comp)
+    # 7) re-voice & render
+    rendered_out, chosen_names = assemble_from_resolved_progressions(melody, resolved_key, pat_bass, pat_comp)
 
-    # MIDI 저장 (원키 리보이싱 결과 + 원본 멜로디)
-    out_mid = os.path.join(OUTPUT_DIR, f"harmony_{ts}.mid")
-    HK.export_mid(rendered_out, melody, bpm, out_mid, monitor_channel=HK.CH_MELODY_DEFAULT)
+    # BPM handling
+    if (not bpm) or bpm <= 0:
+        from mido import tempo2bpm
+        bpm = float(tempo2bpm(first_tempo)) if first_tempo else 120.0
 
-    # 디스플레이용 코드 구간(라벨): 오직 표시용으로만 CSV 라벨 이조 사용
-    # (사운드는 숫자 이조 결과에 기반)
-    # 한 블록=8마디=BLOCK_BEATS
-    label_progs = [HK.transpose_progression_labels(p, offset, CHORD_TABLE) for p in chosen_in_C]
-    segments = []
-    for i, lp in enumerate(label_progs):
-        segments += _make_segments_from_progression_labels(lp, i)
+    # 8) export
+    out_name = f"harmonized_{uuid.uuid4().hex}.mid"
+    out_path = os.path.join(PUBLIC_DIR, out_name)
+    export_mid(rendered_out, melody, bpm, out_path, monitor_channel=CH_MELODY_DEFAULT)
 
-    # 총 길이(비트) – 블록 수 * BLOCK_BEATS
-    duration_beats = len(resolved_key) * HK.BLOCK_BEATS
+    midi_url = make_abs_url(request, f"/files/{out_name}")
 
-    # 다운로드 URL
-    midi_url = f"/files/{os.path.basename(out_mid)}"
-
-    return JSONResponse({
+    return {
         "ok": True,
-        "bpm": bpm,
         "key_label": key_label,
-        "offset": offset,
-        "duration_beats": duration_beats,
+        "chosen_progressions": chosen_names,
         "midi_url": midi_url,
-        "chosen_progressions": chosen_names,   # 디버그/로그용
-        "segments": segments,                  # 코드 변경 위치(시각화용)
-        "genre": genre,
-        "patterns": {
-            "bass": os.path.basename(bass_mid),
-            "comping": os.path.basename(comp_mid),
-        },
-    })
+        # "audio_url": None,  # (선택) 사운드폰트 렌더 후 제공하고 싶다면 여기에 절대 URL 넣기
+        "genre_used": genre_used,
+        "total_beats": rendered_out.total_beats,
+        "bpm": bpm,
+    }
+
+# alias for older frontends
+@app.post("/analyze")
+async def analyze_alias(
+    request: Request,
+    midi_file: UploadFile = File(...),
+    bpm: float = Form(120.0),
+    genre: str = Form("basic"),
+):
+    return await harmonize(request, midi_file, bpm, genre)
